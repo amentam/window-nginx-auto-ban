@@ -1,0 +1,40 @@
+{
+  "name": "nginx-auto-ban",
+  "version": "1.0.0",
+  "description": "Nginx 自动封禁攻击 IP 系统",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "pm2:start": "pm2 start dist/index.js --name nginx-ban",
+    "pm2:stop": "pm2 stop nginx-ban",
+    "pm2:restart": "pm2 restart nginx-ban",
+    "pm2:logs": "pm2 logs nginx-ban"
+  },
+  "keywords": [
+    "nginx",
+    "security",
+    "firewall",
+    "auto-ban"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "dotenv": "^17.4.2",
+    "geoip-lite": "^2.0.2",
+    "moment": "^2.30.1",
+    "nodemailer": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/chokidar": "^2.1.7",
+    "@types/geoip-lite": "^1.4.4",
+    "@types/moment": "^2.13.0",
+    "@types/node": "^25.9.3",
+    "@types/nodemailer": "^8.0.1",
+    "nodemon": "^3.1.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
