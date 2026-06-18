@@ -106,9 +106,13 @@ export class LogParser {
       return uaCheck;
     }
 
-    // 4. 大量 403 掃描特徵
-    if (entry.status === 403 && entry.request.includes("/")) {
-      return { isSuspicious: true, reason: "403 禁止訪問" };
+    // 4. 403 + 可疑路徑組合：只標記同時滿足 403 且匹配已知攻擊路徑的請求
+    //    避免將正常應用的 403（如未登入的 API 呼叫）誤判為攻擊
+    if (entry.status === 403) {
+      const pathCheck = this.isSuspiciousPath(entry.request);
+      if (pathCheck.isSuspicious) {
+        return { isSuspicious: true, reason: `403 禁止訪問 (${pathCheck.matchedPattern})` };
+      }
     }
 
     return { isSuspicious: false, reason: "" };
