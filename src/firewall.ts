@@ -335,6 +335,7 @@ export class FirewallManager {
       // 防火牆更新成功後，才修改記憶體
       this.bannedIPs.delete(ip);
       this.bannedAt.delete(ip);
+      this.saveToFile();
       logger.info(`已解封 IP: ${ip}`);
       return true;
     } catch (error) {
@@ -416,6 +417,18 @@ export class FirewallManager {
       ip,
       timestamp: this.bannedAt.get(ip) || "-",
     }));
+  }
+
+  private saveToFile(): void {
+    const records = Array.from(this.bannedIPs).map((ip) => ({
+      ip,
+      timestamp: this.bannedAt.get(ip) || "-",
+    }));
+    const data = {
+      bannedRecords: records,
+      timestamp: new Date().toISOString(),
+    };
+    fs.writeFileSync(this.bannedFile, JSON.stringify(data, null, 2));
   }
 
   // loadBannedIPs(ips: string[]): void {

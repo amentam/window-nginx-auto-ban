@@ -6,6 +6,7 @@ import { Config } from "./types";
 dotenv.config();
 
 function loadPatternsFromFile(): {
+  highConfidencePatterns: string[];
   suspiciousPatterns: string[];
   scannerUserAgents: string[];
 } {
@@ -16,14 +17,17 @@ function loadPatternsFromFile(): {
   if (fs.existsSync(patternsFile)) {
     try {
       const data = JSON.parse(fs.readFileSync(patternsFile, "utf8"));
+      const highConfidencePatterns = (
+        data.highConfidencePatterns || []
+      ).map((s: string) => s.trim().toLowerCase());
       const suspiciousPatterns = (
         data.suspiciousPatterns || []
       ).map((s: string) => s.trim().toLowerCase());
       const scannerUserAgents = (
         data.scannerUserAgents || []
       ).map((s: string) => s.trim().toLowerCase());
-      if (suspiciousPatterns.length > 0 && scannerUserAgents.length > 0) {
-        return { suspiciousPatterns, scannerUserAgents };
+      if (highConfidencePatterns.length > 0 && suspiciousPatterns.length > 0 && scannerUserAgents.length > 0) {
+        return { highConfidencePatterns, suspiciousPatterns, scannerUserAgents };
       }
     } catch {
       // 檔案損毀時 fallback 到預設值
@@ -31,9 +35,16 @@ function loadPatternsFromFile(): {
   }
 
   // Fallback: 從環境變數載入
+  const highConfidencePatterns = (
+    process.env.HIGH_CONFIDENCE_PATTERNS ||
+    ".env,wp-login.php,wp-admin,adminer-,phpMyAdmin,xmlrpc.php,.git/config,/SDK/,/wp-content/,/.well-known/,/.git/,wp-config,phpinfo,/cgi-bin/,/hmc/,/WebInterface/,CDGServer3,adminMember,adminexec,adminnav,/oauth/token"
+  )
+    .split(",")
+    .map((s) => s.trim().toLowerCase());
+
   const suspiciousPatterns = (
     process.env.SUSPICIOUS_PATTERNS ||
-    ".env,wp-login.php,wp-admin,adminer-,phpMyAdmin,xmlrpc.php,.git/config,/SDK/,/backup/,/wp-content/,/includes/,/modules/,/components/,/.well-known/,security.txt,sitemap.xml,llms.txt,adminMember,adminexec,adminnav,CDGServer3,/oauth/token,/hmc/,/WebInterface/,/cgi-bin/,/.git/,.php,wp-config,phpinfo,credentials,.bak,.old,.save,.backup,.staging,.local,aws-config,aws.config,config.php,config.js"
+    "/backup/,/includes/,/modules/,/components/,security.txt,sitemap.xml,llms.txt,.php,.bak,.old,.save,.backup,.staging,.local,aws-config,aws.config,config.php,config.js"
   )
     .split(",")
     .map((s) => s.trim().toLowerCase());
@@ -45,13 +56,13 @@ function loadPatternsFromFile(): {
     .split(",")
     .map((s) => s.trim().toLowerCase());
 
-  return { suspiciousPatterns, scannerUserAgents };
+  return { highConfidencePatterns, suspiciousPatterns, scannerUserAgents };
 }
 
 export function loadConfig(): Config {
   const whitelistStr = process.env.WHITELIST || "127.0.0.1";
   const whitelist = whitelistStr.split(",").map((ip) => ip.trim());
-  const { suspiciousPatterns, scannerUserAgents } = loadPatternsFromFile();
+  const { highConfidencePatterns, suspiciousPatterns, scannerUserAgents } = loadPatternsFromFile();
 
   return {
     nodeEnv: process.env.NODE_ENV || "development",
@@ -91,8 +102,10 @@ export function loadConfig(): Config {
     suspiciousFile:
       process.env.SUSPICIOUS_FILE ||
       path.join(process.cwd(), "suspicious_ips.json"),
+    highConfidencePatterns,
     suspiciousPatterns,
     scannerUserAgents,
+    autoUnbanHours: parseInt(process.env.AUTO_UNBAN_HOURS || "0"),
   };
 }
 

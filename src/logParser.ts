@@ -6,17 +6,27 @@ export class LogParser {
   private attackStats: Map<string, AttackStats> = new Map();
 
   constructor(
+    private highConfidencePatterns: string[],
     private suspiciousPatterns: string[],
     private scannerUserAgents: string[],
   ) {}
 
   /** 執行情更新可疑路徑模式（Web UI 新增/刪除後呼叫） */
-  updatePatterns(patterns: string[], userAgents: string[]): void {
-    this.suspiciousPatterns = patterns.map((s) => s.trim().toLowerCase());
+  updatePatterns(highConfidence: string[], lowConfidence: string[], userAgents: string[]): void {
+    this.highConfidencePatterns = highConfidence.map((s) => s.trim().toLowerCase());
+    this.suspiciousPatterns = lowConfidence.map((s) => s.trim().toLowerCase());
     this.scannerUserAgents = userAgents.map((s) => s.trim().toLowerCase());
   }
 
   getPatterns(): string[] {
+    return [...this.highConfidencePatterns, ...this.suspiciousPatterns];
+  }
+
+  getHighConfidencePatterns(): string[] {
+    return [...this.highConfidencePatterns];
+  }
+
+  getSuspiciousPatterns(): string[] {
     return [...this.suspiciousPatterns];
   }
 
@@ -54,7 +64,21 @@ export class LogParser {
   }
 
   /**
-   * 檢查請求路徑是否匹配可疑模式
+   * 檢查請求路徑是否匹配高風險模式（明顯攻擊，如 .env、wp-admin）
+   */
+  isHighConfidencePath(request: string): DetectionResult {
+    const lowerRequest = request.toLowerCase();
+
+    for (const pattern of this.highConfidencePatterns) {
+      if (lowerRequest.includes(pattern)) {
+        return { isSuspicious: true, reason: "高風險攻擊路徑", matchedPattern: pattern };
+      }
+    }
+    return { isSuspicious: false, reason: "" };
+  }
+
+  /**
+   * 檢查請求路徑是否匹配低風險可疑模式（可能為正常流量）
    */
   isSuspiciousPath(request: string): DetectionResult {
     const lowerRequest = request.toLowerCase();
@@ -87,46 +111,54 @@ export class LogParser {
   }
 
   /**
-   * 多層次可疑請求偵測
+   * 多層次可疑請求偵測（高/低風險分級）
+   *
+   * 🔴 高風險（明顯攻擊）→ 直接判定，不問狀態碼
+   * 🟡 低風險（可能正常）→ 需搭配 403/429/掃描器 UA 才判定
+   *
    * 整合：狀態碼 + URL 路徑 + User-Agent
    */
   analyzeEntry(entry: LogEntry): DetectionResult {
-    // 1. 傳統攻擊狀態碼
+    // 1. 傳統攻擊狀態碼（502/503/504）→ 直接判定
     if (this.isAttackStatus(entry.status)) {
       return { isSuspicious: true, reason: `攻擊狀態碼 ${entry.status}` };
     }
 
-    // 2. 可疑 URL 路徑（即使狀態碼是 200/307/403）
-    const pathCheck = this.isSuspiciousPath(entry.request);
-    if (pathCheck.isSuspicious) {
-      return pathCheck;
+    // 2. 🔴 高風險路徑（.env、wp-admin、.git 等明顯攻擊）→ 直接判定
+    const highCheck = this.isHighConfidencePath(entry.request);
+    if (highCheck.isSuspicious) {
+      return highCheck;
     }
 
-    // 3. 已知掃描器 User-Agent
+    // 3. 已知掃描器 User-Agent → 直接判定
     const uaCheck = this.isScannerUserAgent(entry.userAgent);
     if (uaCheck.isSuspicious) {
       return uaCheck;
     }
 
-    // 4. 403 + 可疑路徑組合：只標記同時滿足 403 且匹配已知攻擊路徑的請求
-    //    避免將正常應用的 403（如未登入的 API 呼叫）誤判為攻擊
+    // 4. 🟡 低風險路徑 + 403/429/掃描器 UA → 組合判定
+    const lowCheck = this.isSuspiciousPath(entry.request);
+    if (lowCheck.isSuspicious) {
+      if (entry.status === 403) {
+        return { isSuspicious: true, reason: `403 + 可疑路徑 (${lowCheck.matchedPattern})` };
+      }
+      if (entry.status === 429) {
+        return { isSuspicious: true, reason: `429 + 可疑路徑 (${lowCheck.matchedPattern})` };
+      }
+      // 低風險路徑但狀態碼正常 → 不判定（避免誤判正常流量）
+    }
+
+    // 5. 403 + 高風險路徑（已在步驟 2 涵蓋，此處為冗餘保護）
     if (entry.status === 403) {
-      const pathCheck = this.isSuspiciousPath(entry.request);
-      if (pathCheck.isSuspicious) {
-        return { isSuspicious: true, reason: `403 禁止訪問 (${pathCheck.matchedPattern})` };
+      const hcCheck = this.isHighConfidencePath(entry.request);
+      if (hcCheck.isSuspicious) {
+        return { isSuspicious: true, reason: `403 禁止訪問 (${hcCheck.matchedPattern})` };
       }
     }
 
-    // 5. 429 + 可疑路徑/掃描器 UA 組合：避免正常 rate-limiting 誤判
+    // 6. 429 + 掃描器 UA（已在步驟 3 涵蓋，此處處理僅 429 無 UA 的情況）
     if (entry.status === 429) {
-      const pathCheck = this.isSuspiciousPath(entry.request);
-      if (pathCheck.isSuspicious) {
-        return { isSuspicious: true, reason: `429 限流 (${pathCheck.matchedPattern})` };
-      }
-      const uaCheck = this.isScannerUserAgent(entry.userAgent);
-      if (uaCheck.isSuspicious) {
-        return { isSuspicious: true, reason: `429 限流 (${uaCheck.matchedPattern})` };
-      }
+      // 429 單獨出現（無可疑路徑、無掃描器 UA）→ 可能是正常 rate-limiting，不判定
     }
 
     return { isSuspicious: false, reason: "" };

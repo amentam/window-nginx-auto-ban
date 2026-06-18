@@ -56,7 +56,9 @@ export interface Config {
   banSubnet: "off" | "auto" | "force";
   suspiciousFile: string;
   suspiciousPatterns: string[];
+  highConfidencePatterns: string[];
   scannerUserAgents: string[];
+  autoUnbanHours: number;
 }
 
 export interface AttackStats {

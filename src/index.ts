@@ -23,14 +23,24 @@ class NginxAutoBan {
   private isRunning: boolean = true;
   // 可疑 IP 審查佇列（未達自動封鎖閾值，或手動模式）
   private suspiciousRecords: Map<string, SuspiciousRecord> = new Map();
-  // 子網封鎖追蹤：記錄已封鎖單一 IP 的子網前綴，用於 auto 模式升級
-  // key: "x.x.x" → 已封鎖 IP 數量
-  private subnetBannedCount: Map<string, number> = new Map();
+
+  /** 即時計算指定 /24 子網中已封鎖的單一 IP 數量（用於 auto 模式升級判斷） */
+  private countBannedInSubnet(subnetPrefix: string): number {
+    let count = 0;
+    for (const ip of this.firewall.getBannedIPs()) {
+      if (!ip.includes("/")) {
+        const prefix = ip.substring(0, ip.lastIndexOf("."));
+        if (prefix === subnetPrefix) count++;
+      }
+    }
+    return count;
+  }
 
 
   constructor() {
     this.firewall = new FirewallManager(config.bannedFile);
     this.logParser = new LogParser(
+      config.highConfidencePatterns,
       config.suspiciousPatterns,
       config.scannerUserAgents,
     );
@@ -50,8 +60,8 @@ class NginxAutoBan {
         (ip: string) => this.banFromSuspicious(ip),
         (ip: string) => this.ignoreSuspicious(ip),
         // 傳遞模式管理回呼（新增/刪除後即時更新 LogParser）
-        (patterns: string[], userAgents: string[]) => {
-          this.logParser.updatePatterns(patterns, userAgents);
+        (highConfidence: string[], lowConfidence: string[], userAgents: string[]) => {
+          this.logParser.updatePatterns(highConfidence, lowConfidence, userAgents);
         },
         // 傳遞手動封鎖回呼（測試防火牆用）
         (ip: string) => this.banManual(ip),
@@ -109,11 +119,14 @@ class NginxAutoBan {
       this.startPeriodicScan();
     }
 
-    // 定期檢查防火牆規則（每 5 分鐘確認規則是否存在，被手動刪除時自動重建）
-    // setInterval(async () => {
-    //   if (!this.isRunning) return;
-    //   await this.firewall.syncFirewallRule();
-    // }, 5 * 60 * 1000);
+    // 自動解封：每 10 分鐘檢查一次過期封鎖
+    if (config.autoUnbanHours > 0) {
+      logger.info(`🔓 自動解封已啟用：封鎖超過 ${config.autoUnbanHours} 小時自動解除`);
+      setInterval(async () => {
+        if (!this.isRunning) return;
+        await this.autoUnbanExpired();
+      }, 10 * 60 * 1000);
+    }
 
     // 優雅退出
     this.setupGracefulShutdown();
@@ -144,8 +157,12 @@ class NginxAutoBan {
     logger.info(`封禁閾值: ${config.banThreshold} 次/分鐘${subnetLabel}`);
     logger.info(`白名單: ${config.whitelist.join(", ")}`);
     logger.info(`即時監控: ${config.realTimeMonitoring ? "開啟" : "關閉"}`);
-    logger.info(`可疑路徑模式: ${config.suspiciousPatterns.length} 條（來源: ${fs.existsSync(patternsFile) ? "patterns.json" : "環境變數"}）`);
+    logger.info(`🔴 高風險模式: ${config.highConfidencePatterns.length} 條（直接判定）`);
+    logger.info(`🟡 低風險模式: ${config.suspiciousPatterns.length} 條（需搭配 403/429/掃描器UA）`);
     logger.info(`掃描器 UA: ${config.scannerUserAgents.length} 條`);
+    if (config.autoUnbanHours > 0) {
+      logger.info(`🔓 自動解封: ${config.autoUnbanHours} 小時後`);
+    }
     logger.info("=".repeat(50));
   }
 
@@ -165,15 +182,6 @@ class NginxAutoBan {
         }
       } catch (err) {
         logger.error("載入黑名單失敗:", err as Error);
-      }
-    }
-
-    // 初始化子網封鎖追蹤：統計已封鎖的單一 IP 所屬子網（CIDR 不計入）
-    this.subnetBannedCount.clear();
-    for (const bannedIP of this.firewall.getBannedIPs()) {
-      if (!bannedIP.includes("/")) {
-        const prefix = bannedIP.substring(0, bannedIP.lastIndexOf("."));
-        this.subnetBannedCount.set(prefix, (this.subnetBannedCount.get(prefix) || 0) + 1);
       }
     }
   }
@@ -474,8 +482,16 @@ class NginxAutoBan {
         if (isWhitelistedIP(ip)) continue;
         const accCount = this.accumulatedStats.get(ip)?.count || attackStats.count;
         const suspiciousRec = this.suspiciousRecords.get(ip);
-        const uniquePatternCount = suspiciousRec?.matchedPatterns?.length || 0;
-        const shouldBan = accCount >= config.banThreshold || uniquePatternCount >= 3;
+
+        // 只統計高風險模式命中數（低風險模式需要搭配 403/429 才會觸發，不單獨計入）
+        const highConfidenceHits = suspiciousRec?.matchedPatterns?.filter(
+          (p) => config.highConfidencePatterns.includes(p),
+        ).length || 0;
+
+        // 封鎖條件：次數達標 OR 命中 3+ 種高風險模式且累積 ≥ 5 次（避免單次誤判）
+        const shouldBan =
+          accCount >= config.banThreshold ||
+          (highConfidenceHits >= 3 && accCount >= 5);
 
         if (shouldBan) {
           // 決定目標：off=單一IP, force=整個/24, auto=先單一後升級
@@ -487,8 +503,8 @@ class NginxAutoBan {
             targetIP = ipToCidr(ip);
             isSubnetBan = true;
           } else if (config.banSubnet === "auto") {
-            // auto 模式：檢查該子網已有幾個單一 IP 被封鎖
-            const existingCount = this.subnetBannedCount.get(subnetPrefix) || 0;
+            // auto 模式：即時計算該子網中已封鎖的單一 IP 數量
+            const existingCount = this.countBannedInSubnet(subnetPrefix);
             if (existingCount >= 2) {
               // 已有 2+ 個不同 IP 被封 → 升級為子網封鎖
               targetIP = ipToCidr(ip);
@@ -515,8 +531,8 @@ class NginxAutoBan {
 
           if (!isWhitelisted && !isAlreadyBanned) {
             // === 首次封鎖 ===
-            const reasonByPattern = uniquePatternCount >= 3
-              ? `匹配 ${uniquePatternCount} 種可疑模式（${suspiciousRec?.matchedPatterns?.join(", ") || ""}）`
+            const reasonByPattern = highConfidenceHits >= 3
+              ? `匹配 ${highConfidenceHits} 種高風險攻擊模式（${suspiciousRec?.matchedPatterns?.join(", ") || ""}）`
               : `${accCount}次攻擊請求（閾值 ${config.banThreshold} 次/分鐘）`;
 
             const banRecord: any = {
@@ -553,16 +569,6 @@ class NginxAutoBan {
 
             const banned = await this.firewall.banIP(banRecord);
             if (banned) {
-              // 更新子網封鎖追蹤
-              if (isSubnetBan) {
-                this.subnetBannedCount.delete(subnetPrefix);
-              } else {
-                this.subnetBannedCount.set(
-                  subnetPrefix,
-                  (this.subnetBannedCount.get(subnetPrefix) || 0) + 1,
-                );
-              }
-
               // 標記為本次呼叫內剛封鎖，防止同一批次內觸發重複告警
               freshlyBannedInThisCall.add(targetIP);
 
@@ -733,15 +739,6 @@ class NginxAutoBan {
 
     const banned = await this.firewall.banIP(banRecord);
     if (banned) {
-      // 更新子網封鎖追蹤
-      if (!isForceSubnet) {
-        const subnetPrefix = ip.substring(0, ip.lastIndexOf("."));
-        this.subnetBannedCount.set(
-          subnetPrefix,
-          (this.subnetBannedCount.get(subnetPrefix) || 0) + 1,
-        );
-      }
-
       rec.status = "banned";
       this.saveSuspiciousRecords();
       this.saveBannedIPs();
@@ -759,6 +756,37 @@ class NginxAutoBan {
       this.saveSuspiciousRecords();
       logger.info(`已標記為忽略 IP: ${ip}`);
     }
+  }
+
+  /** 自動解封過期的封鎖記錄 */
+  private async autoUnbanExpired(): Promise<void> {
+    const now = new Date();
+    const expireMs = config.autoUnbanHours * 60 * 60 * 1000;
+    const toUnban: string[] = [];
+
+    for (const record of this.firewall.getBannedIPsWithTime()) {
+      const ip = record.ip;
+      const banTime = new Date(record.timestamp);
+      if (now.getTime() - banTime.getTime() >= expireMs) {
+        toUnban.push(ip);
+      }
+    }
+
+    if (toUnban.length === 0) return;
+
+    logger.info(`🔓 自動解封 ${toUnban.length} 個過期 IP: ${toUnban.join(", ")}`);
+
+    for (const ip of toUnban) {
+      const success = await this.firewall.unbanIP(ip);
+      if (success) {
+        // 更新審查記錄
+        const rec = this.suspiciousRecords.get(ip);
+        if (rec) rec.status = "ignored";
+      }
+    }
+
+    this.saveBannedIPs();
+    this.saveSuspiciousRecords();
   }
 
   private setupGracefulShutdown(): void {

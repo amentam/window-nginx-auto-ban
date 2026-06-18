@@ -7,8 +7,9 @@
 ## 📋 功能特色
 
 - **即時監控** — 每秒掃描 Nginx 日誌增量變化，即時偵測攻擊
-- **多層次偵測** — 整合攻擊狀態碼（429/502/503/504）、可疑 URL 路徑、已知掃描器 User-Agent、403 大量掃描
+- **多層次偵測** — 高/低風險分級：明顯攻擊（`.env`、`wp-admin`）直接判定；低風險模式（`.php`、`/backup/`）需搭配 403/429/掃描器 UA 才判定
 - **自動封禁** — 達到閾值自動將 IP 加入 Windows 防火牆黑名單
+- **自動解封** — 可設定封鎖時效（`AUTO_UNBAN_HOURS`），到期自動解除防火牆規則
 - **子網封鎖** — 支援 `auto`（智慧升級）/ `force`（強制 /24）/ `off` 三種模式
 - **Web 管理介面** — 內建儀表板，檢視封禁列表、審查可疑 IP、管理偵測規則、查閱日誌
 - **郵件告警** — 首次封鎖 IP 時發送 HTML/純文字雙格式通知
@@ -84,11 +85,14 @@ SCAN_INTERVAL=60
 # 自動封禁開關：false 僅記錄不封鎖（手動審查模式）
 AUTO_BAN=true
 
+# 自動解封時數：0=關閉（永久封鎖），>0=封鎖 N 小時後自動解除
+AUTO_UNBAN_HOURS=0
+
 # 子網封鎖模式：off=僅封單IP, auto=智慧升級, force=強制封/24
 BAN_SUBNET=auto
 
 # IP 白名單（逗號分隔）
-WHITELIST=127.0.0.1,192.168.1.0/24
+WHITELIST=127.0.0.1
 
 # 郵件通知
 SMTP_ENABLED=true
@@ -130,19 +134,22 @@ pnpm pm2:logs
 
 ## 🔍 攻擊偵測邏輯
 
-系統採用**多層次偵測**，符合任一條件即標記為可疑：
+系統採用**高/低風險分級**的多層次偵測，避免將正常流量（如未登入的 403、rate-limiting 的 429）誤判為攻擊：
 
-| 層級 | 偵測方式 | 說明 |
-|------|----------|------|
-| 1 | 攻擊狀態碼 | 429（限流）、502、503、504 |
-| 2 | 可疑 URL 路徑 | 比對 `patterns.json` 中的模式（如 `.env`、`wp-admin`、`phpMyAdmin` 等） |
-| 3 | 掃描器 User-Agent | 比對已知工具（如 sqlmap、nmap、nessus、burpsuite 等） |
-| 4 | 403 大量掃描 | 大量回傳 403 的請求 |
+| 優先級 | 層級 | 偵測方式 | 說明 |
+|--------|------|----------|------|
+| 1 | 🔴 攻擊狀態碼 | 502 / 503 / 504 | 伺服器端異常，直接判定 |
+| 2 | 🔴 高風險路徑 | `.env`、`wp-admin`、`.git`、`phpMyAdmin` 等 | 明顯攻擊路徑，**直接判定**（不問狀態碼） |
+| 3 | 🔴 掃描器 UA | sqlmap、nmap、burpsuite 等 | 已知攻擊工具，直接判定 |
+| 4 | 🟡 低風險 + 403 | `.php`、`/backup/`、`config.js` 等 + 403 | **需組合判定**：低風險路徑且返回 403 |
+| 5 | 🟡 低風險 + 429 | 同上 + 429 | **需組合判定**：低風險路徑且被限流 |
+
+> ⚠️ **重要**：單純的 403（如未登入 API 呼叫）或單純的 429（正常 rate-limiting）**不會**被判定為攻擊，避免誤封正常用戶。
 
 ### 封鎖條件（滿足其一即觸發）
 
-1. 1 分鐘內可疑請求數 ≥ `BAN_THRESHOLD`
-2. 匹配 ≥ 3 種不同的可疑路徑模式
+1. 1 分鐘內可疑請求數 ≥ `BAN_THRESHOLD`（預設 30 次）
+2. 命中 ≥ 3 種**高風險**模式，且累積 ≥ 5 次請求
 
 ---
 
@@ -167,7 +174,7 @@ pnpm pm2:logs
 | 模式 | 行為 |
 |------|------|
 | `off` | 僅封鎖單一 IP |
-| `auto` | 同一 /24 子網內有 ≥3 個 IP 被封鎖時，自動升級為封鎖整個 /24 子網 |
+| `auto` | 同一 /24 子網內有 ≥2 個 IP 被封鎖時，自動升級為封鎖整個 /24 子網 |
 | `force` | 一律封鎖整個 /24 子網 |
 
 ---
@@ -183,27 +190,29 @@ pnpm pm2:logs
 
 ## 🔧 模式管理
 
-`patterns.json` 是可疑偵測規則的設定檔，可透過 Web UI 或直接編輯：
+`patterns.json` 是可疑偵測規則的設定檔，分為高/低風險兩級：
 
 ```json
 {
+  "highConfidencePatterns": [
+    ".env", "wp-login.php", "wp-admin", "phpMyAdmin",
+    ".git/config", "/.git/", "wp-config", "phpinfo",
+    "/cgi-bin/", "/oauth/token", ...
+  ],
   "suspiciousPatterns": [
-    ".env",
-    "wp-login.php",
-    "wp-admin",
-    "phpMyAdmin",
-    ".git/config",
-    ...
+    "/backup/", "/includes/", "/modules/", ".php",
+    ".bak", ".old", "config.js", "sitemap.xml", ...
   ],
   "scannerUserAgents": [
-    "sqlmap",
-    "nmap",
-    "nessus",
-    "burpsuite",
-    ...
+    "sqlmap", "nmap", "nessus", "burpsuite", ...
   ]
 }
 ```
+
+| 分類 | 行為 | 管理方式 |
+|------|------|----------|
+| 🔴 `highConfidencePatterns` | 命中即判定攻擊 | 僅能手動編輯 JSON 檔 |
+| 🟡 `suspiciousPatterns` | 需搭配 403/429/掃描器 UA | Web UI 或手動編輯 |
 
 修改後即時生效，無需重啟服務。
 

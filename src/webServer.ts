@@ -22,7 +22,7 @@ export class WebServer {
     private getSuspiciousRecords: () => SuspiciousRecord[],
     private banSuspicious: (ip: string) => Promise<boolean>,
     private ignoreSuspicious: (ip: string) => void,
-    private updatePatterns: (patterns: string[], userAgents: string[]) => void,
+    private updatePatterns: (highConfidence: string[], lowConfidence: string[], userAgents: string[]) => void,
     private banManual: (ip: string) => Promise<boolean>,
     logParser: LogParser,
     getLogPath: (date?: string) => string,
@@ -246,35 +246,51 @@ export class WebServer {
     res.end(JSON.stringify({ success: true }));
   }
 
-  private loadPatternsFile(): { suspiciousPatterns: string[]; scannerUserAgents: string[] } {
+  private loadPatternsFile(): {
+    highConfidencePatterns: string[];
+    suspiciousPatterns: string[];
+    scannerUserAgents: string[];
+  } {
     try {
       const data = JSON.parse(fs.readFileSync(this.patternsFile, "utf8"));
       return {
+        highConfidencePatterns: data.highConfidencePatterns || [],
         suspiciousPatterns: data.suspiciousPatterns || [],
         scannerUserAgents: data.scannerUserAgents || [],
       };
     } catch {
-      return { suspiciousPatterns: config.suspiciousPatterns, scannerUserAgents: config.scannerUserAgents };
+      return {
+        highConfidencePatterns: config.highConfidencePatterns,
+        suspiciousPatterns: config.suspiciousPatterns,
+        scannerUserAgents: config.scannerUserAgents,
+      };
     }
   }
 
-  private savePatternsFile(patterns: string[], userAgents: string[]): void {
+  private savePatternsFile(
+    highConfidence: string[],
+    suspicious: string[],
+    userAgents: string[],
+  ): void {
     const data = {
-      suspiciousPatterns: patterns,
+      highConfidencePatterns: highConfidence,
+      suspiciousPatterns: suspicious,
       scannerUserAgents: userAgents,
     };
     fs.writeFileSync(this.patternsFile, JSON.stringify(data, null, 2));
     // 即時更新 LogParser 中的規則
-    this.updatePatterns(patterns, userAgents);
+    this.updatePatterns(highConfidence, suspicious, userAgents);
   }
 
   private async handleApiPatterns(
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
-    const { suspiciousPatterns } = this.loadPatternsFile();
+    const { highConfidencePatterns, suspiciousPatterns } = this.loadPatternsFile();
+    // 合併回傳給前端（維持向後兼容：前端看到的是合併列表）
+    const allPatterns = [...highConfidencePatterns, ...suspiciousPatterns];
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ patterns: suspiciousPatterns }));
+    res.end(JSON.stringify({ patterns: allPatterns }));
   }
 
   private async handleApiPatternsAdd(
@@ -289,15 +305,16 @@ export class WebServer {
       return;
     }
 
-    const { suspiciousPatterns, scannerUserAgents } = this.loadPatternsFile();
-    if (suspiciousPatterns.includes(pattern)) {
+    const { highConfidencePatterns, suspiciousPatterns, scannerUserAgents } = this.loadPatternsFile();
+    if (highConfidencePatterns.includes(pattern) || suspiciousPatterns.includes(pattern)) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: false, error: "該模式已存在" }));
       return;
     }
 
+    // Web UI 新增一律加入低風險清單（高風險清單僅能手動編輯 patterns.json）
     suspiciousPatterns.push(pattern);
-    this.savePatternsFile(suspiciousPatterns, scannerUserAgents);
+    this.savePatternsFile(highConfidencePatterns, suspiciousPatterns, scannerUserAgents);
     logger.info(`Web UI 新增可疑路徑模式: ${pattern}`);
 
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -316,15 +333,24 @@ export class WebServer {
       return;
     }
 
-    const { suspiciousPatterns, scannerUserAgents } = this.loadPatternsFile();
-    if (index > suspiciousPatterns.length) {
+    const { highConfidencePatterns, suspiciousPatterns, scannerUserAgents } = this.loadPatternsFile();
+    const allPatterns = [...highConfidencePatterns, ...suspiciousPatterns];
+    if (index > allPatterns.length) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: false, error: "索引超出範圍" }));
       return;
     }
 
-    const removed = suspiciousPatterns.splice(index - 1, 1)[0];
-    this.savePatternsFile(suspiciousPatterns, scannerUserAgents);
+    const removed = allPatterns[index - 1];
+    // 判斷刪除的是高風險還是低風險
+    const hcIdx = highConfidencePatterns.indexOf(removed);
+    if (hcIdx !== -1) {
+      highConfidencePatterns.splice(hcIdx, 1);
+    } else {
+      const lcIdx = suspiciousPatterns.indexOf(removed);
+      if (lcIdx !== -1) suspiciousPatterns.splice(lcIdx, 1);
+    }
+    this.savePatternsFile(highConfidencePatterns, suspiciousPatterns, scannerUserAgents);
     logger.info(`Web UI 刪除可疑路徑模式: ${removed}`);
 
     res.writeHead(200, { "Content-Type": "application/json" });
