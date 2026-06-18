@@ -48,7 +48,9 @@ export class LogParser {
    * 傳統攻擊狀態碼偵測
    */
   isAttackStatus(status: number): boolean {
-    return [429, 502, 503, 504].includes(status);
+    // 只保留真正的伺服器端異常：502/503/504
+    // 429 移至下方與可疑路徑組合判斷，避免正常 rate-limiting 誤判
+    return [502, 503, 504].includes(status);
   }
 
   /**
@@ -112,6 +114,18 @@ export class LogParser {
       const pathCheck = this.isSuspiciousPath(entry.request);
       if (pathCheck.isSuspicious) {
         return { isSuspicious: true, reason: `403 禁止訪問 (${pathCheck.matchedPattern})` };
+      }
+    }
+
+    // 5. 429 + 可疑路徑/掃描器 UA 組合：避免正常 rate-limiting 誤判
+    if (entry.status === 429) {
+      const pathCheck = this.isSuspiciousPath(entry.request);
+      if (pathCheck.isSuspicious) {
+        return { isSuspicious: true, reason: `429 限流 (${pathCheck.matchedPattern})` };
+      }
+      const uaCheck = this.isScannerUserAgent(entry.userAgent);
+      if (uaCheck.isSuspicious) {
+        return { isSuspicious: true, reason: `429 限流 (${uaCheck.matchedPattern})` };
       }
     }
 
