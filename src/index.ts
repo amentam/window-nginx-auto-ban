@@ -298,8 +298,9 @@ class NginxAutoBan {
 
     this.currentLogDate = moment().format("YYYY-MM-DD");
 
-    // 每 10 秒顯示一次心跳，確認監控存活
-    let heartbeatTick = 0;
+    // 記錄上次輸出報告的小時，用於整點報告與 debug 心跳
+    let lastReportedHour = -1;
+    let lastDebugHeartbeat = 0;
 
     // 定時掃描日誌檔案變化
     setInterval(async () => {
@@ -339,19 +340,30 @@ class NginxAutoBan {
           },
         );
 
-        // 心跳：Debug 模式每 10 秒，否則每小時顯示狀態
-        heartbeatTick++;
-        const heartbeatInterval = config.debug ? 10 : 3600;
-        if (heartbeatTick >= heartbeatInterval) {
-          heartbeatTick = 0;
-          const fileSize = fs.existsSync(currentPath)
-            ? fs.statSync(currentPath).size
-            : 0;
-          if (config.debug) {
+        // 心跳報告：Debug 模式每 10 秒，否則每小時的 00 分輸出
+        const now = moment();
+        const currentHour = now.hour();
+        const currentMinute = now.minute();
+        const nowMs = Date.now();
+
+        if (config.debug) {
+          // Debug 模式：每 10 秒輸出一次心跳
+          if (nowMs - lastDebugHeartbeat >= 10000) {
+            lastDebugHeartbeat = nowMs;
+            const fileSize = fs.existsSync(currentPath)
+              ? fs.statSync(currentPath).size
+              : 0;
             logger.info(
               `📡 即時監控運作中 | 檔案: ${path.basename(currentPath)} | ${fileSize} 位元組 | 掃描位置: ${newPosition}`,
             );
-          } else {
+          }
+        } else {
+          // 正式模式：每小時 00 分輸出報告（只觸發一次）
+          if (currentMinute === 0 && currentHour !== lastReportedHour) {
+            lastReportedHour = currentHour;
+            const fileSize = fs.existsSync(currentPath)
+              ? fs.statSync(currentPath).size
+              : 0;
             const bannedCount = this.firewall.getBannedIPs().size;
             logger.info(
               `📡 [每小時報告] 已掃描 ${fileSize} 位元組 | 已封禁 ${bannedCount} 個 IP | 監控中: ${path.basename(currentPath)}`,
