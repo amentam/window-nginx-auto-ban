@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node src/index.ts",
-    "build": "tsc",
+    "clean": "rm -rf dist",
+    "build": "pnpm run clean && tsc",
     "start": "node dist/index.js",
     "pm2:start": "pm2 start dist/index.js --name nginx-ban",
     "pm2:stop": "pm2 stop nginx-ban",

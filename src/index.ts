@@ -24,6 +24,12 @@ class NginxAutoBan {
   // 可疑 IP 審查佇列（未達自動封鎖閾值，或手動模式）
   private suspiciousRecords: Map<string, SuspiciousRecord> = new Map();
 
+  // 永久封鎖名單（曾解封後再次攻擊 → 永久封鎖，不再自動解封）
+  private permanentBans: Set<string> = new Set();
+
+  // 曾自動解封的 IP/子網（用於判斷是否為再犯）
+  private previouslyUnbanned: Map<string, string> = new Map(); // ip → unbannedAt ISO string
+
   /** 即時計算指定 /24 子網中已封鎖的單一 IP 數量（用於 auto 模式升級判斷） */
   private countBannedInSubnet(subnetPrefix: string): number {
     let count = 0;
@@ -48,6 +54,10 @@ class NginxAutoBan {
 
     // 載入可疑 IP 審查記錄
     this.loadSuspiciousRecords();
+
+    // 載入永久封鎖名單與解封歷史
+    this.loadPermanentBans();
+    this.loadPreviouslyUnbanned();
 
     if (config.web.enabled) {
       this.webServer = new WebServer(
@@ -162,6 +172,11 @@ class NginxAutoBan {
     logger.info(`掃描器 UA: ${config.scannerUserAgents.length} 條`);
     if (config.autoUnbanHours > 0) {
       logger.info(`🔓 自動解封: ${config.autoUnbanHours} 小時後`);
+      logger.info(`🔓 子網自動解封: ${config.autoUnbanSubnet ? "允許" : "禁止"}`);
+      logger.info(`🚫 再犯永久封鎖: 啟用`);
+    }
+    if (this.permanentBans.size > 0) {
+      logger.info(`🔒 永久封鎖名單: ${this.permanentBans.size} 筆`);
     }
     logger.info("=".repeat(50));
   }
@@ -505,8 +520,8 @@ class NginxAutoBan {
           } else if (config.banSubnet === "auto") {
             // auto 模式：即時計算該子網中已封鎖的單一 IP 數量
             const existingCount = this.countBannedInSubnet(subnetPrefix);
-            if (existingCount >= 2) {
-              // 已有 2+ 個不同 IP 被封 → 升級為子網封鎖
+            if (existingCount >= 1) {
+              // 已有 1+ 個不同 IP 被封 → 升級為子網封鎖
               targetIP = ipToCidr(ip);
               isSubnetBan = true;
             } else {
@@ -530,6 +545,21 @@ class NginxAutoBan {
             this.isCoveredByExistingCIDR(targetIP);
 
           if (!isWhitelisted && !isAlreadyBanned) {
+            // === 檢查是否為再犯（曾解封後再次攻擊 → 永久封鎖） ===
+            const isRepeatOffender =
+              this.previouslyUnbanned.has(targetIP) ||
+              (isSubnetBan && this.previouslyUnbanned.has(targetIP)) ||
+              this.previouslyUnbanned.has(ip) ||
+              Array.from(this.previouslyUnbanned.keys()).some(
+                (k) => k.includes("/") && ip.startsWith(k.split("/")[0].substring(0, k.split("/")[0].lastIndexOf("."))),
+              );
+
+            if (isRepeatOffender) {
+              this.permanentBans.add(targetIP);
+              this.savePermanentBans();
+              logger.warn(`🚫 ${targetIP} 為再犯 IP，已標記為永久封鎖（不再自動解封）`);
+            }
+
             // === 首次封鎖 ===
             const reasonByPattern = highConfidenceHits >= 3
               ? `匹配 ${highConfidenceHits} 種高風險攻擊模式（${suspiciousRec?.matchedPatterns?.join(", ") || ""}）`
@@ -537,14 +567,17 @@ class NginxAutoBan {
 
             const banRecord: any = {
               ip: targetIP,
-              reason: isSubnetBan
-                ? `子網 ${targetIP} 出現多次攻擊，升級封鎖 - ${reasonByPattern}`
-                : reasonByPattern,
+              reason: isRepeatOffender
+                ? `⚠️ 永久封鎖：曾解封後再次攻擊 - ${isSubnetBan ? `子網 ${targetIP} 出現多次攻擊，升級封鎖 - ` : ""}${reasonByPattern}`
+                : isSubnetBan
+                  ? `子網 ${targetIP} 出現多次攻擊，升級封鎖 - ${reasonByPattern}`
+                  : reasonByPattern,
               sampleRequest: attackStats.sampleRequest,
               sampleRequests: attackStats.sampleRequests,
               timestamp: new Date().toISOString(),
               requestCount: accCount,
               ruleName: `AutoBan_${targetIP.replace(/[\.\/]/g, "_")}`,
+              permanent: isRepeatOffender,
             };
 
             // 查詢 IP 地理位置
@@ -667,6 +700,61 @@ class NginxAutoBan {
     }
   }
 
+  /** 載入永久封鎖名單 */
+  private loadPermanentBans(): void {
+    if (!fs.existsSync(config.permanentBanFile)) return;
+    try {
+      const data = JSON.parse(fs.readFileSync(config.permanentBanFile, "utf8"));
+      if (data.permanentBans && Array.isArray(data.permanentBans)) {
+        for (const ip of data.permanentBans) {
+          this.permanentBans.add(ip);
+        }
+      }
+      logger.info(`載入了 ${this.permanentBans.size} 筆永久封鎖記錄`);
+    } catch (err) {
+      logger.error("載入永久封鎖記錄失敗:", err as Error);
+    }
+  }
+
+  /** 儲存永久封鎖名單 */
+  private savePermanentBans(): void {
+    const data = {
+      permanentBans: Array.from(this.permanentBans),
+      timestamp: new Date().toISOString(),
+    };
+    fs.writeFileSync(config.permanentBanFile, JSON.stringify(data, null, 2));
+  }
+
+  /** 載入曾解封記錄 */
+  private loadPreviouslyUnbanned(): void {
+    const file = path.join(path.dirname(config.permanentBanFile), "unbanned_history.json");
+    if (!fs.existsSync(file)) return;
+    try {
+      const data = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (data.unbannedRecords && Array.isArray(data.unbannedRecords)) {
+        for (const rec of data.unbannedRecords) {
+          this.previouslyUnbanned.set(rec.ip, rec.unbannedAt);
+        }
+      }
+      logger.info(`載入了 ${this.previouslyUnbanned.size} 筆解封歷史記錄`);
+    } catch (err) {
+      logger.error("載入解封歷史記錄失敗:", err as Error);
+    }
+  }
+
+  /** 儲存曾解封記錄 */
+  private savePreviouslyUnbanned(): void {
+    const file = path.join(path.dirname(config.permanentBanFile), "unbanned_history.json");
+    const records = Array.from(this.previouslyUnbanned.entries()).map(
+      ([ip, unbannedAt]) => ({ ip, unbannedAt }),
+    );
+    const data = {
+      unbannedRecords: records,
+      timestamp: new Date().toISOString(),
+    };
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  }
+
   /** Web UI 用：取得所有可疑 IP 記錄 */
   getSuspiciousRecords(): SuspiciousRecord[] {
     return Array.from(this.suspiciousRecords.values());
@@ -763,13 +851,34 @@ class NginxAutoBan {
     const now = new Date();
     const expireMs = config.autoUnbanHours * 60 * 60 * 1000;
     const toUnban: string[] = [];
+    const skippedSubnet: string[] = [];
+    const skippedPermanent: string[] = [];
 
     for (const record of this.firewall.getBannedIPsWithTime()) {
       const ip = record.ip;
       const banTime = new Date(record.timestamp);
-      if (now.getTime() - banTime.getTime() >= expireMs) {
-        toUnban.push(ip);
+      if (now.getTime() - banTime.getTime() < expireMs) continue;
+
+      // 檢查是否為永久封鎖
+      if (this.permanentBans.has(ip)) {
+        skippedPermanent.push(ip);
+        continue;
       }
+
+      // 檢查是否為子網封鎖且不允許自動解封子網
+      if (ip.includes("/") && !config.autoUnbanSubnet) {
+        skippedSubnet.push(ip);
+        continue;
+      }
+
+      toUnban.push(ip);
+    }
+
+    if (skippedSubnet.length > 0) {
+      logger.info(`🔒 跳過子網自動解封（AUTO_UNBAN_SUBNET=false）: ${skippedSubnet.join(", ")}`);
+    }
+    if (skippedPermanent.length > 0) {
+      logger.info(`🔒 跳過永久封鎖自動解封: ${skippedPermanent.join(", ")}`);
     }
 
     if (toUnban.length === 0) return;
@@ -779,6 +888,10 @@ class NginxAutoBan {
     for (const ip of toUnban) {
       const success = await this.firewall.unbanIP(ip);
       if (success) {
+        // 記錄到曾解封名單（再犯時永久封鎖）
+        this.previouslyUnbanned.set(ip, now.toISOString());
+        this.savePreviouslyUnbanned();
+
         // 更新審查記錄
         const rec = this.suspiciousRecords.get(ip);
         if (rec) rec.status = "ignored";
@@ -795,6 +908,8 @@ class NginxAutoBan {
       this.isRunning = false;
       this.saveBannedIPs();
       this.saveSuspiciousRecords();
+      this.savePermanentBans();
+      this.savePreviouslyUnbanned();
 
       if (this.webServer) {
         this.webServer.stop();

@@ -59,6 +59,8 @@ export interface Config {
   highConfidencePatterns: string[];
   scannerUserAgents: string[];
   autoUnbanHours: number;
+  autoUnbanSubnet: boolean;
+  permanentBanFile: string;
 }
 
 export interface AttackStats {

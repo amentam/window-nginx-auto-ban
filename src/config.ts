@@ -106,6 +106,10 @@ export function loadConfig(): Config {
     suspiciousPatterns,
     scannerUserAgents,
     autoUnbanHours: parseInt(process.env.AUTO_UNBAN_HOURS || "0"),
+    autoUnbanSubnet: process.env.AUTO_UNBAN_SUBNET === "true",
+    permanentBanFile:
+      process.env.PERMANENT_BAN_FILE ||
+      path.join(process.cwd(), "permanent_bans.json"),
   };
 }
 
