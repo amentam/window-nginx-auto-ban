@@ -445,8 +445,9 @@ class NginxAutoBan {
       }
       this.lastAccumulationCleanup = now;
 
-      // 每小時清理一次過期可疑記錄（7 天未處理自動刪除）
+      // 每小時清理一次過期記錄
       this.purgeStaleSuspiciousRecords(now);
+      this.purgeStalePreviouslyUnbanned(now);
     }
 
     // 將所有可疑 IP 記錄到審查佇列（忽略白名單 IP）
@@ -679,9 +680,12 @@ class NginxAutoBan {
     fs.writeFileSync(config.suspiciousFile, JSON.stringify(data, null, 2));
   }
 
-  /** 清理超過 7 天未處理的 pending/ignored 可疑記錄 */
+  /** 清理過期記錄：
+   *  - pending/ignored：超過 7 天未處理自動刪除
+   *  - banned：超過 30 天自動刪除（記憶體釋放，防火牆規則不受影響） */
   private purgeStaleSuspiciousRecords(now: Date): void {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     let purged = 0;
 
     for (const [ip, rec] of this.suspiciousRecords) {
@@ -691,12 +695,36 @@ class NginxAutoBan {
           this.suspiciousRecords.delete(ip);
           purged++;
         }
+      } else if (rec.status === "banned") {
+        const lastSeen = new Date(rec.lastSeen);
+        if (lastSeen < thirtyDaysAgo) {
+          this.suspiciousRecords.delete(ip);
+          purged++;
+        }
       }
     }
 
     if (purged > 0) {
       this.saveSuspiciousRecords();
-      logger.info(`🧹 自動清理 ${purged} 筆超過 7 天未處理的可疑記錄`);
+      logger.info(`🧹 自動清理 ${purged} 筆過期可疑記錄`);
+    }
+  }
+
+  /** 清理超過 90 天的解封歷史（再犯觀察期已過） */
+  private purgeStalePreviouslyUnbanned(now: Date): void {
+    const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    let purged = 0;
+
+    for (const [ip, unbannedAt] of this.previouslyUnbanned) {
+      if (new Date(unbannedAt) < ninetyDaysAgo) {
+        this.previouslyUnbanned.delete(ip);
+        purged++;
+      }
+    }
+
+    if (purged > 0) {
+      this.savePreviouslyUnbanned();
+      logger.info(`🧹 自動清理 ${purged} 筆超過 90 天的解封歷史`);
     }
   }
 
