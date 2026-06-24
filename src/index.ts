@@ -522,6 +522,19 @@ class NginxAutoBan {
           (highConfidenceHits >= 3 && accCount >= 5);
 
         if (shouldBan) {
+          // 若該 IP 本身已被封鎖（個別 IP 或已被既有 CIDR 涵蓋），跳過不再重複處理
+          // 避免 auto 模式下同一 IP 再次觸發時，被 countBannedInSubnet 計入自身
+          // 而誤觸發子網升級，導致連續發送重複封鎖電郵
+          if (this.firewall.getBannedIPs().has(ip) || this.isCoveredByExistingCIDR(ip)) {
+            const existingRec = this.suspiciousRecords.get(ip);
+            if (existingRec) {
+              existingRec.lastSeen = attackStats.lastSeen.toISOString();
+              existingRec.count = Math.max(existingRec.count, accCount);
+              this.saveSuspiciousRecords();
+            }
+            continue;
+          }
+
           // 決定目標：off=單一IP, force=整個/24, auto=先單一後升級
           const subnetPrefix = ip.substring(0, ip.lastIndexOf("."));
           let targetIP: string;
@@ -532,9 +545,15 @@ class NginxAutoBan {
             isSubnetBan = true;
           } else if (config.banSubnet === "auto") {
             // auto 模式：即時計算該子網中已封鎖的單一 IP 數量
+            // 排除本次批次內剛封鎖的 IP，避免同一批次內因剛封鎖的 IP
+            // 觸發子網升級而發送重複的「封鎖 IP + 封鎖子網」兩封電郵
             const existingCount = this.countBannedInSubnet(subnetPrefix);
-            if (existingCount >= 1) {
-              // 已有 1+ 個不同 IP 被封 → 升級為子網封鎖
+            const freshlyBannedInSubnet = Array.from(freshlyBannedInThisCall).filter(
+              (banned) => !banned.includes("/") && banned.startsWith(subnetPrefix + "."),
+            ).length;
+            const effectiveCount = existingCount - freshlyBannedInSubnet;
+            if (effectiveCount >= 1) {
+              // 已有 1+ 個不同 IP 被封（來自之前批次）→ 升級為子網封鎖
               targetIP = ipToCidr(ip);
               isSubnetBan = true;
             } else {
